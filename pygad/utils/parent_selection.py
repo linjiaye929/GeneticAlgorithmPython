@@ -600,8 +600,10 @@ class ParentSelection:
                         # There is only a single solution with the maximum crowding distance. Just select it.
                         selected_parent_index = current_indices_unique[solutions_crowding_distance.index(max_crowding_distance)]
                     else:
-                        # If the crowding distance is equal across multiple solutions, select a solution randomly as a parent.
-                        selected_parent_index = self.numpy_random_generator.choice(current_indices_unique)
+                        # Break ties only among the candidates with the maximum crowding distance.
+                        max_crowding_candidates = current_indices_unique[
+                            numpy.array(solutions_crowding_distance) == max_crowding_distance]
+                        selected_parent_index = self.numpy_random_generator.choice(max_crowding_candidates)
 
             # Insert the selected parent index.
             parents_indices.append(selected_parent_index)

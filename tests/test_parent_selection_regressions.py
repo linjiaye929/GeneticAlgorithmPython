@@ -212,3 +212,118 @@ def test_probability_selection_preserves_python_integer_fitness(selection):
 
     assert indices.shape == (2,)
     numpy.testing.assert_array_equal(parents, ga_instance.population[indices])
+
+
+@pytest.mark.parametrize("run_generation", [False, True])
+def test_nsga2_tournament_seeded_selection_prefers_crowding_boundaries(run_generation):
+    def tradeoff_fitness(ga_instance, solution, solution_idx):
+        return [solution[0], 2 - solution[0]]
+
+    expected_candidates = []
+    selections = []
+
+    def record_tournament(ga_instance, fitness):
+        # Observe the next draw without replacing or advancing the real RNG.
+        observer = numpy.random.RandomState()
+        observer.set_state(ga_instance.numpy_random_generator.get_state())
+        candidates = observer.randint(0, 3, size=(1, 3))[0]
+        # All three rows are nondominated; only rows 0 and 2 are boundaries.
+        boundaries = set(candidates) & {0, 2}
+        expected_candidates.append(boundaries or {1})
+
+    def check_parents(ga_instance, parents):
+        selected = ga_instance.last_generation_parents_indices
+        assert selected[0] in expected_candidates[-1]
+        numpy.testing.assert_array_equal(parents, ga_instance.population[selected])
+        selections.append(selected.copy())
+
+    ga_instance = pygad.GA(num_generations=1,
+                           num_parents_mating=1,
+                           fitness_func=tradeoff_fitness,
+                           initial_population=[[0, 10], [1, 11], [2, 12]],
+                           parent_selection_type="tournament_nsga2",
+                           K_tournament=3,
+                           mutation_probability=0.0,
+                           random_seed=24,
+                           on_fitness=record_tournament,
+                           on_parents=check_parents)
+    if run_generation:
+        ga_instance.run()
+        assert ga_instance.generations_completed == 1
+        assert len(selections) == 1
+    else:
+        fitness = ga_instance.cal_pop_fitness()
+        record_tournament(ga_instance, fitness)
+        parents, indices = ga_instance.select_parents(fitness, 1)
+        assert indices[0] in expected_candidates[-1]
+        numpy.testing.assert_array_equal(parents, ga_instance.population[indices])
+
+
+@pytest.mark.parametrize("fitness,candidates,expected", [
+    # One front: tied boundaries, a unique boundary, and duplicate draws.
+    ([[0, 2], [1, 1], [2, 0]], [0, 1, 2], [0, 2]),
+    ([[0, 2], [1, 1], [2, 0]], [0, 2], [0, 2]),
+    ([[0, 2], [1, 1], [2, 0]], [0, 1], [0]),
+    ([[0, 2], [1, 1], [2, 0]], [1, 1], [1]),
+    ([[0, 2], [1, 1], [2, 0]], [1], [1]),
+    # Mixed fronts: rank is decided before crowding distance.
+    ([[0, 2], [1, 1], [2, 0], [0, 0], [0, 1]], [3, 0, 1, 2], [0, 2]),
+    ([[0, 2], [1, 1], [2, 0], [0, 0], [0, 1]], [2, 1, 0, 1, 0], [0, 2]),
+    ([[0, 2], [1, 1], [2, 0], [0, 0], [0, 1]], [1, 3, 4], [1]),
+    ([[0, 2], [1, 1], [2, 0], [0, 0], [0, 1]], [1, 1, 3, 4], [1]),
+    # Noncontiguous front membership must still use population indices.
+    ([[0, 0], [0, 8], [1, 7], [1, 1], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [2, 4, 6, 7, 3], [4, 6]),
+    # Finite distances are [inf, .5, .75, 1, .75, .5, inf].
+    # Nonparticipating boundaries must never enter the tie-break.
+    ([[0, 8], [1, 7], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [1, 2, 4, 5], [2, 4]),
+    ([[0, 8], [1, 7], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [1, 2, 4, 2, 5], [2, 4]),
+    ([[0, 8], [1, 7], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [1, 2, 3, 4, 5], [3]),
+    ([[0, 8], [1, 7], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [2, 4], [2, 4]),
+    ([[0, 8], [1, 7], [2, 6], [4, 4], [6, 2], [7, 1], [8, 0]],
+     [1, 2], [2]),
+])
+@pytest.mark.parametrize("reverse_candidates", [False, True])
+def test_nsga2_tournament_tie_break_only_samples_best_candidates(
+        monkeypatch, fitness, candidates, expected, reverse_candidates):
+    fitness = numpy.array(fitness)
+
+    def multi_objective_fitness(ga_instance, solution, solution_idx):
+        return fitness[solution_idx]
+
+    ga_instance = pygad.GA(num_generations=1,
+                           num_parents_mating=1,
+                           fitness_func=multi_objective_fitness,
+                           initial_population=numpy.arange(2 * len(fitness)).reshape(-1, 2),
+                           parent_selection_type="tournament_nsga2",
+                           K_tournament=len(candidates),
+                           mutation_probability=0.0,
+                           random_seed=24)
+    if reverse_candidates:
+        candidates = candidates[::-1]
+    # Control tournament membership only. Fronts and distances remain genuine,
+    # and choice still delegates to the real seeded NumPy generator.
+    generator = Mock(wraps=ga_instance.numpy_random_generator)
+    generator.randint.return_value = numpy.array([candidates])
+    monkeypatch.setattr(ga_instance, "numpy_random_generator", generator)
+    original_population = ga_instance.population.copy()
+
+    parents, indices = ga_instance.select_parents(fitness, 1)
+
+    assert indices.shape == (1,)
+    assert indices[0] in expected
+    numpy.testing.assert_array_equal(parents, original_population[indices])
+    assert parents.dtype == original_population.dtype
+    if len(expected) > 1:
+        generator.choice.assert_called_once()
+        tie_candidates = generator.choice.call_args[0][0]
+        assert set(tie_candidates) == set(expected)
+        assert len(tie_candidates) == len(expected)
+    else:
+        generator.choice.assert_not_called()
+    parents[:] = -1
+    numpy.testing.assert_array_equal(ga_instance.population, original_population)
